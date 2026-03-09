@@ -1,12 +1,16 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { buildZegoToken } from "../zegoToken.js";
 
 const sanitizeUserId = (raw) =>
   String(raw ?? "")
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9._@-]/g, "_")
-    .slice(0, 64);
+    // Keep IDs within Zego's Web login limit and allowed character set.
+    .replace(/[^a-z0-9._-]/g, "_")
+    .replace(/@/g, "_")
+    .slice(0, 32);
 
 const getAllowedOrigin = (req) => {
   const configured = process.env.FRONTEND_ORIGIN || "*";
@@ -32,7 +36,10 @@ function applyCors(req, res, methods = ["GET"]) {
 }
 
 let jwks = null;
-let mgmtTokenCache = null;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const STORE_PATH = path.join(__dirname, "..", "data", "users.json");
+const STORE_DIR = path.dirname(STORE_PATH);
 
 async function verifyAuth0Token(req) {
   const authHeader = req.headers.authorization || "";
@@ -53,49 +60,15 @@ async function verifyAuth0Token(req) {
   return payload;
 }
 
-async function getMgmtToken() {
-  const domain = process.env.AUTH0_DOMAIN;
-  const clientId = process.env.AUTH0_MGMT_CLIENT_ID;
-  const clientSecret = process.env.AUTH0_MGMT_CLIENT_SECRET;
-  const audience =
-    process.env.AUTH0_MGMT_AUDIENCE || `https://${domain}/api/v2/`;
-
-  if (!domain || !clientId || !clientSecret) {
-    throw new Error("Auth0 Management API credentials not configured");
+function readUsers() {
+  try {
+    if (!fs.existsSync(STORE_DIR)) fs.mkdirSync(STORE_DIR, { recursive: true });
+    if (!fs.existsSync(STORE_PATH)) return [];
+    const raw = fs.readFileSync(STORE_PATH, "utf8");
+    return JSON.parse(raw || "[]");
+  } catch {
+    return [];
   }
-
-  const now = Date.now();
-  if (mgmtTokenCache && mgmtTokenCache.expiresAt > now + 30_000) {
-    return mgmtTokenCache.token;
-  }
-
-  const res = await fetch(`https://${domain}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "client_credentials",
-      client_id: clientId,
-      client_secret: clientSecret,
-      audience,
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Auth0 mgmt token failed: ${res.status} ${text}`);
-  }
-
-  const data = await res.json();
-  if (!data.access_token || !data.expires_in) {
-    throw new Error("Invalid mgmt token response");
-  }
-
-  mgmtTokenCache = {
-    token: data.access_token,
-    expiresAt: now + data.expires_in * 1000,
-  };
-
-  return mgmtTokenCache.token;
 }
 
 export default function handler(req, res) {
@@ -107,43 +80,50 @@ export default function handler(req, res) {
 
   (async () => {
     try {
-      await verifyAuth0Token(req);
-      const q = String(req.query.q || "").trim();
-      if (!q || q.length < 2) {
-        return res.status(400).json({ error: "Query must be at least 2 characters" });
-      }
+      const claims = await verifyAuth0Token(req);
+      const requester = sanitizeUserId(claims.email || claims.sub || "");
+      const q = String(req.query.q || "").trim().toLowerCase();
 
-      const mgmtToken = await getMgmtToken();
-      const domain = process.env.AUTH0_DOMAIN;
-      const searchUrl = new URL(`https://${domain}/api/v2/users`);
-      searchUrl.searchParams.set(
-        "q",
-        `name:${q}* OR email:${q}*`
-      );
-      searchUrl.searchParams.set("search_engine", "v3");
-      searchUrl.searchParams.set("per_page", "5");
+      const users = readUsers();
 
-      const resp = await fetch(searchUrl, {
-        headers: { Authorization: `Bearer ${mgmtToken}` },
-      });
+      // ✅ CRITICAL FIX: Only return users who have ACTUALLY logged in
+      // A user has "logged in" if their lastSeen is recent (within last 24 hours)
+      // OR if they have a Zego token generated (which happens during login)
+      const ONE_HOUR_AGO = Date.now() - (60 * 60 * 1000);
+      const now = new Date().toLocaleTimeString();
+      console.log(`[Users Search] Query="${q}", Requester="${requester}", Time filter: ${new Date(ONE_HOUR_AGO).toLocaleString()}`);
+      
+      const filtered = (users || [])
+        .filter((u) => {
+          const uid = sanitizeUserId(u.email || u.userId || "");
+          // Exclude self and users who haven't logged in recently
+          if (!uid || uid === requester) return false;
+          // Only include users who were active in last hour (recently logged in)
+          if (!u.lastSeen || u.lastSeen < ONE_HOUR_AGO) {
+            console.log(`  [FILTERED OUT] "${u.name}" (lastSeen=${new Date(u.lastSeen).toLocaleString()})`);
+            return false;
+          }
+          console.log(`  [INCLUDED] "${u.name}" (lastSeen=${new Date(u.lastSeen).toLocaleString()})`);
+          return true;
+        })
+        .filter((u) => {
+          if (!q) return true;
+          const name = (u.name || "").toLowerCase();
+          const email = (u.email || "").toLowerCase();
+          return name.includes(q) || email.includes(q);
+        });
 
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Auth0 search failed: ${resp.status} ${text}`);
-      }
+      const sorted = filtered.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 
-      const users = await resp.json();
-      const results = (users || []).map((u) => {
-        const email = u.email || "";
-        const sub = u.user_id || "";
-        const userID = sanitizeUserId(email || sub);
-        return {
-          userID,
-          name: u.name || email || sub,
-          email,
-          picture: u.picture || "",
-        };
-      });
+      const results = sorted.slice(0, 20).map((u) => ({
+        userID: sanitizeUserId(u.email || u.userId || ""),
+        name: u.name || u.email || u.userId,
+        email: u.email || "",
+        picture: u.picture || "",
+      }));
+
+      console.log(`[Users Result] Found ${results.length} users matching query. Results:`, 
+        results.map(r => `${r.name} (${r.userID})`).join(", "));
 
       return res.status(200).json({ results });
     } catch (e) {

@@ -4,8 +4,10 @@ const sanitizeUserId = (raw) =>
   String(raw ?? "")
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9._@-]/g, "_")
-    .slice(0, 64);
+    // Keep IDs within Zego's Web login limit and allowed character set.
+    .replace(/[^a-z0-9._-]/g, "_")
+    .replace(/@/g, "_")
+    .slice(0, 32);
 
 let jwks = null;
 
@@ -79,9 +81,12 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Could not derive userID from Auth0 token" });
     }
 
+    console.log(`[Token] Generating Zego token for userID="${userID}" (email=${claims.email})`);
     const token = buildZegoToken(userID);
+    console.log(`[Token] Token generated successfully, length=${token.length}`);
     return res.status(200).json({ token, userID });
   } catch (e) {
+    console.error(`[Token] Error:`, e);
     const msg = e?.message || "Token generation failed";
     const status =
       msg.includes("Authorization") ? 401 :
