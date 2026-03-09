@@ -16,6 +16,32 @@ const sanitizeUserId = (raw) =>
     .replace(/@/g, "_")
     .slice(0, 32);
 
+const getAllowedOrigin = (req) => {
+  const configured = process.env.FRONTEND_ORIGIN || "*";
+  const origins = configured
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  if (origins.includes("*")) return "*";
+
+  const reqOrigin = req.headers.origin;
+  if (reqOrigin && origins.includes(reqOrigin)) return reqOrigin;
+
+  return origins[0] || "*";
+};
+
+function applyCors(req, res) {
+  const origin = getAllowedOrigin(req);
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (origin !== "*") {
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+}
+
 async function verifyAuth0Token(req) {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
@@ -61,9 +87,7 @@ function writeUsers(users) {
 }
 
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  applyCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
