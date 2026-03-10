@@ -16,10 +16,10 @@ const getAllowedOrigin = (req) => {
   const configured = process.env.FRONTEND_ORIGIN || "*";
   const origins = configured
     .split(",")
-    .map((o) => o.trim())
+    .map((o) => o.trim().replace(/\/$/, ""))
     .filter(Boolean);
   if (origins.includes("*")) return "*";
-  const reqOrigin = req.headers.origin;
+  const reqOrigin = (req.headers.origin || "").replace(/\/$/, "");
   if (reqOrigin && origins.includes(reqOrigin)) return reqOrigin;
   return origins[0] || "*";
 };
