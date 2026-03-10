@@ -26,6 +26,7 @@ app.get("/", (req, res) => {
 
 app.get("/api/health", (req, res) => health(req, res));
 app.get("/api/token", (req, res) => token(req, res));
+app.options("/api/token", (req, res) => token(req, res));
 app.get("/api/users", (req, res) => users(req, res));
 app.post("/api/me", (req, res) => me(req, res));
 app.options("/api/me", (req, res) => me(req, res));
