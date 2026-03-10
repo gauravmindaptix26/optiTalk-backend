@@ -3,11 +3,13 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
+const ONLINE_WINDOW_MS = 5 * 60 * 1000;
+const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 const sanitizeUserId = (raw) =>
   String(raw ?? "")
     .trim()
     .toLowerCase()
-    // Keep IDs within Zego's Web login limit and allowed character set.
     .replace(/[^a-z0-9._-]/g, "_")
     .replace(/@/g, "_")
     .slice(0, 32);
@@ -71,59 +73,93 @@ function readUsers() {
   }
 }
 
+function getPresenceMeta(lastSeen) {
+  const lastSeenNumber = Number(lastSeen || 0);
+  if (!lastSeenNumber) {
+    return {
+      presence: "unknown",
+      isOnline: false,
+      sortBucket: 2,
+    };
+  }
+
+  const age = Date.now() - lastSeenNumber;
+  if (age <= ONLINE_WINDOW_MS) {
+    return {
+      presence: "online",
+      isOnline: true,
+      sortBucket: 0,
+    };
+  }
+
+  if (age <= RECENT_WINDOW_MS) {
+    return {
+      presence: "recent",
+      isOnline: false,
+      sortBucket: 1,
+    };
+  }
+
+  return {
+    presence: "offline",
+    isOnline: false,
+    sortBucket: 2,
+  };
+}
+
 export default function handler(req, res) {
   applyCors(req, res, ["GET"]);
 
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "GET")
+  if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
+  }
 
   (async () => {
     try {
       const claims = await verifyAuth0Token(req);
       const requester = sanitizeUserId(claims.email || claims.sub || "");
       const q = String(req.query.q || "").trim().toLowerCase();
-
       const users = readUsers();
 
-      // ✅ CRITICAL FIX: Only return users who have ACTUALLY logged in
-      // A user has "logged in" if their lastSeen is recent (within last 24 hours)
-      // OR if they have a Zego token generated (which happens during login)
-      const ONE_HOUR_AGO = Date.now() - (60 * 60 * 1000);
-      const now = new Date().toLocaleTimeString();
-      console.log(`[Users Search] Query="${q}", Requester="${requester}", Time filter: ${new Date(ONE_HOUR_AGO).toLocaleString()}`);
-      
       const filtered = (users || [])
-        .filter((u) => {
-          const uid = sanitizeUserId(u.email || u.userId || "");
-          // Exclude self and users who haven't logged in recently
-          if (!uid || uid === requester) return false;
-          // Only include users who were active in last hour (recently logged in)
-          if (!u.lastSeen || u.lastSeen < ONE_HOUR_AGO) {
-            console.log(`  [FILTERED OUT] "${u.name}" (lastSeen=${new Date(u.lastSeen).toLocaleString()})`);
-            return false;
+        .map((user) => {
+          const userID = sanitizeUserId(user.email || user.userId || "");
+          if (!userID || userID === requester) return null;
+
+          const name = user.name || user.email || user.userId || userID;
+          const email = user.email || "";
+          if (q) {
+            const nameValue = String(name).toLowerCase();
+            const emailValue = String(email).toLowerCase();
+            if (!nameValue.includes(q) && !emailValue.includes(q)) return null;
           }
-          console.log(`  [INCLUDED] "${u.name}" (lastSeen=${new Date(u.lastSeen).toLocaleString()})`);
-          return true;
+
+          const presenceMeta = getPresenceMeta(user.lastSeen);
+          return {
+            userID,
+            name,
+            email,
+            picture: user.picture || "",
+            lastSeen: Number(user.lastSeen || 0),
+            presence: presenceMeta.presence,
+            isOnline: presenceMeta.isOnline,
+            sortBucket: presenceMeta.sortBucket,
+          };
         })
-        .filter((u) => {
-          if (!q) return true;
-          const name = (u.name || "").toLowerCase();
-          const email = (u.email || "").toLowerCase();
-          return name.includes(q) || email.includes(q);
-        });
+        .filter(Boolean);
 
-      const sorted = filtered.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+      const sorted = filtered.sort((a, b) => {
+        if (a.sortBucket !== b.sortBucket) return a.sortBucket - b.sortBucket;
+        return (b.lastSeen || 0) - (a.lastSeen || 0);
+      });
 
-      const results = sorted.slice(0, 20).map((u) => ({
-        userID: sanitizeUserId(u.email || u.userId || ""),
-        name: u.name || u.email || u.userId,
-        email: u.email || "",
-        picture: u.picture || "",
-      }));
+      const results = sorted.slice(0, 20).map(({ sortBucket, ...user }) => user);
 
-      console.log(`[Users Result] Found ${results.length} users matching query. Results:`, 
-        results.map(r => `${r.name} (${r.userID})`).join(", "));
+      console.log(
+        `[Users Result] Found ${results.length} users for "${q}".`,
+        results.map((user) => `${user.name} [${user.presence}]`).join(", "),
+      );
 
       return res.status(200).json({ results });
     } catch (e) {
