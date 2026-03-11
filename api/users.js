@@ -120,11 +120,12 @@ export default function handler(req, res) {
       const claims = await verifyAuth0Token(req);
       const requester = sanitizeUserId(claims.email || claims.sub || "");
       const q = String(req.query.q || "").trim().toLowerCase();
+      const normalizedQuery = sanitizeUserId(q);
       const users = readUsers();
 
       const filtered = (users || [])
         .map((user) => {
-          const userID = sanitizeUserId(user.email || user.userId || "");
+          const userID = sanitizeUserId(user.userId || user.email || "");
           if (!userID || userID === requester) return null;
 
           const name = user.name || user.email || user.userId || userID;
@@ -132,7 +133,16 @@ export default function handler(req, res) {
           if (q) {
             const nameValue = String(name).toLowerCase();
             const emailValue = String(email).toLowerCase();
-            if (!nameValue.includes(q) && !emailValue.includes(q)) return null;
+            const userIdValue = String(user.userId || userID).toLowerCase();
+            const normalizedEmail = sanitizeUserId(email);
+            const matchesQuery =
+              nameValue.includes(q) ||
+              emailValue.includes(q) ||
+              userIdValue.includes(q) ||
+              (normalizedQuery && userID.includes(normalizedQuery)) ||
+              (normalizedQuery && normalizedEmail.includes(normalizedQuery));
+
+            if (!matchesQuery) return null;
           }
 
           const presenceMeta = getPresenceMeta(user.lastSeen);
